@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: vera-bot
+    runtime: python
+    plan: free            # switch to 'starter' for the evaluation window so it never sleeps
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /v1/healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: VERA_TEAM_NAME
+        value: Team Siddharth
+      - key: VERA_CONTACT_EMAIL
+        value: itssiddharth.18@gmail.com
+      # Optional LLM polish (off unless both are set):
+      - key: VERA_LLM_PROVIDER
+        sync: false
+      - key: VERA_LLM_API_KEY
+        sync: false
