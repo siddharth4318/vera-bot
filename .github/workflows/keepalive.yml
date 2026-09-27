@@ -1,0 +1,23 @@
+name: keep-alive
+
+# Render's free plan sleeps after ~15 idle minutes, and a restart wipes the
+# in-memory context. Pinging the health endpoint keeps the instance warm.
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Ping /v1/healthz
+        run: |
+          for attempt in 1 2 3; do
+            if curl -fsS --max-time 60 "${BOT_URL}/v1/healthz"; then exit 0; fi
+            echo "attempt $attempt failed, retrying"; sleep 10
+          done
+          exit 1
+        env:
+          BOT_URL: https://vera-bot-017u.onrender.com
