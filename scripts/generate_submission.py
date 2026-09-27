@@ -34,7 +34,9 @@ def main() -> None:
     for pair in data.test_pairs():
         trigger = data.trigger(pair["trigger_id"])
         category, merchant, customer = data.contexts_for(trigger)
-        result = compose(category, merchant, trigger, customer, now=SIM_NOW)
+        result = compose(
+            category, merchant, trigger, customer, now=SIM_NOW, roster=data.roster(merchant["merchant_id"])
+        )
         rows.append({"test_id": pair["test_id"], **{k: result[k] for k in CONTRACT_KEYS}})
         if args.show:
             print(

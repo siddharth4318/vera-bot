@@ -38,6 +38,7 @@ convs = ConversationEngine(store)
 sent_keys: set[str] = set()  # suppression keys already used
 sent_bodies: dict[str, set] = {}  # merchant_id -> bodies sent (anti-repeat)
 MAX_ACTIONS = 20
+PER_MERCHANT_PER_TICK = 2  # separate conversations; never two of the same kind
 TICK_BUDGET_S = float(os.getenv("VERA_TICK_BUDGET_S", "22"))
 _pool = ThreadPoolExecutor(max_workers=8)
 
@@ -97,6 +98,7 @@ async def push_context(request: Request):
         ver = int(ver if ver is not None else 1)
     except (TypeError, ValueError):
         return JSONResponse(status_code=400, content={"accepted": False, "reason": "invalid_version"})
+    payload = F.fix_text(payload)  # undo cp1252-decoded UTF-8 ('â‚¹' -> '₹') before storing
     status, cur = store.put(scope, cid, ver, payload)
     if status == "stale":
         return JSONResponse(
@@ -127,7 +129,8 @@ def _plan(tick_now: datetime | None, trigger_ids: list[str]) -> list[tuple]:
     - suppression_key already used -> skip
     - merchant opted out -> skip
     - customer-scope without customer context or consent -> skip
-    - at most one merchant-facing send per merchant per tick (highest urgency wins)
+    - at most two sends per merchant (or merchant+customer) per tick, each in its
+      own conversation and of a different kind; highest urgency first
     """
     cands = []
     for tid in trigger_ids:
@@ -155,20 +158,26 @@ def _plan(tick_now: datetime | None, trigger_ids: list[str]) -> list[tuple]:
                 continue
         cands.append((-(trg.get("urgency") or 0), tid, trg, m, cat, cust))
     cands.sort(key=lambda x: (x[0], x[1]))
-    chosen, seen_m = [], set()
+    chosen, per_key, kinds = [], {}, set()
     for _, _tid, trg, m, cat, cust in cands:
         key = (m.get("merchant_id"), cust.get("customer_id") if cust else None)
-        if key in seen_m:
+        kind_key = (key, trg.get("kind"))
+        if per_key.get(key, 0) >= PER_MERCHANT_PER_TICK or kind_key in kinds:
             continue
-        seen_m.add(key)
+        per_key[key] = per_key.get(key, 0) + 1
+        kinds.add(kind_key)
         chosen.append((trg, m, cat, cust))
         if len(chosen) >= MAX_ACTIONS:
             break
     return chosen
 
 
+def _roster(merchant_id: str | None) -> list[dict]:
+    return [c for c in store.all("customer").values() if c.get("merchant_id") == merchant_id]
+
+
 def _build_action(trg, m, cat, cust, tick_now):
-    r = compose(cat, m, trg, cust, now=tick_now)
+    r = compose(cat, m, trg, cust, now=tick_now, roster=_roster(m.get("merchant_id")))
     if not r.get("_consent_ok", True) or "repeat_of_history" in r.get("_guardrails", []):
         return None
     r = llm.maybe_polish(r, cat, m, trg, cust)
@@ -234,7 +243,7 @@ async def reply(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"action": "end", "rationale": "malformed request"})
     try:
-        return convs.reply(body)
+        return convs.reply(F.fix_text(body))
     except Exception as e:  # never surface a 500 mid-conversation
         return {
             "action": "wait",

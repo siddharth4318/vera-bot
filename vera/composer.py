@@ -1,5 +1,5 @@
 """
-compose(category, merchant, trigger, customer=None, now=None) -> dict
+compose(category, merchant, trigger, customer=None, now=None, roster=None) -> dict
 
 Deterministic entry point. Routing:
     trigger.kind  -> exact handler
@@ -146,6 +146,33 @@ def scrub(body: str, cat: dict) -> tuple[str, list[str]]:
     return body, notes
 
 
+# these handlers already build on the merchant's open request themselves
+HANDLES_OPEN_LOOP = {"active_planning_intent", "supply_alert", "cde_opportunity"}
+
+
+def _acknowledge_open_loop(c: Ctx, body: str, customer_facing: bool) -> str:
+    """If the merchant said yes to something Vera still owes, say it's coming
+    before starting a new topic — dropping a live thread reads as a bot."""
+    if customer_facing or c.trg.get("kind") in HANDLES_OPEN_LOOP:
+        return body
+    owed = F.owed_item(c.m)
+    if not owed:
+        return body
+    thing, focus = owed
+    when = F.day_month((F.last_merchant_turn(c.m) or {}).get("ts"))
+    plural = bool(re.search(r"\b([2-9]|\d{2,})\b", thing)) or thing.endswith("s")
+    note = f"{thing}{f' on {focus}' if focus else ''} you asked for{f' ({when})' if when else ''}"
+    note = f"quick note — {note} {'are' if plural else 'is'} coming separately."
+    for opener in (f"Hi {c.sal}! ", f"{c.sal}, "):
+        if body.startswith(opener):
+            rest = body[len(opener) :]
+            c.cite("merchant.conversation_history (open request acknowledged)")
+            if opener.endswith("! "):
+                return f"{opener}{note[:1].upper()}{note[1:]} {rest[:1].upper()}{rest[1:]}"
+            return f"{opener}{note} {rest[:1].upper()}{rest[1:]}"
+    return body
+
+
 def consent_ok(cust: dict | None) -> bool:
     if not cust:
         return True
@@ -161,11 +188,17 @@ def consent_ok(cust: dict | None) -> bool:
 
 
 def compose(
-    category: dict, merchant: dict, trigger: dict, customer: dict | None = None, now: datetime | None = None
+    category: dict,
+    merchant: dict,
+    trigger: dict,
+    customer: dict | None = None,
+    now: datetime | None = None,
+    roster: list[dict] | None = None,
 ) -> dict:
-    category, merchant, trigger = category or {}, merchant or {}, trigger or {}
+    category, merchant, trigger = F.fix_text(category or {}), F.fix_text(merchant or {}), F.fix_text(trigger or {})
+    customer = F.fix_text(customer) if customer else customer
     customer_facing = bool(customer) and (trigger.get("scope") == "customer" or trigger.get("customer_id"))
-    c = Ctx(category, merchant, trigger, customer if customer_facing else None, now)
+    c = Ctx(category, merchant, trigger, customer if customer_facing else None, now, roster or [])
     fn = route(trigger.get("kind", ""), customer_facing)
     try:
         d: Draft = fn(c)
@@ -173,7 +206,8 @@ def compose(
         c.used.append(f"handler_error:{type(e).__name__}")
         d = cust_handlers.generic_customer(c) if customer_facing else generic(c)
 
-    body, notes = scrub(d.body, category)
+    body = _acknowledge_open_loop(c, d.body, customer_facing)
+    body, notes = scrub(body, category)
 
     # never resend something Vera already said to this merchant; the API layer skips these
     prior = {t.get("body", "").strip() for t in (merchant.get("conversation_history") or []) if t.get("from") == "vera"}

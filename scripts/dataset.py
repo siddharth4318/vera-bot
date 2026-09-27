@@ -51,6 +51,12 @@ class Dataset:
     def test_pairs(self) -> list[dict]:
         return read_json(self.root / "test_pairs.json")["pairs"]
 
+    def roster(self, merchant_id: str) -> list[dict]:
+        """Every customer context that belongs to this merchant."""
+        if not hasattr(self, "_customers"):
+            self._customers = self.all("customers")
+        return [c for c in self._customers if c.get("merchant_id") == merchant_id]
+
     def contexts_for(self, trigger: dict) -> tuple[dict, dict, dict | None]:
         merchant = self.merchant(trigger["merchant_id"])
         return self.categories[merchant["category_slug"]], merchant, self.customer(trigger.get("customer_id"))

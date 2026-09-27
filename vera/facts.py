@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # --------------------------------------------------------------------------- #
@@ -129,6 +129,8 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 
 def parse_dt(s: Any) -> datetime | None:
+    if isinstance(s, datetime):
+        return s if s.tzinfo else s.replace(tzinfo=timezone.utc)
     if not s or not isinstance(s, str):
         return None
     t = s.strip().replace("Z", "+00:00")
@@ -150,6 +152,20 @@ def day_month(s: Any) -> str | None:
     """'2026-11-12' -> '12 Nov'."""
     dt = parse_dt(s)
     return f"{dt.day} {MONTHS[dt.month - 1]}" if dt else None
+
+
+def next_weekday(now: datetime | None, weekday: int) -> datetime | None:
+    """Next given weekday (Mon=0) strictly after `now`."""
+    if not now:
+        return None
+    ahead = (weekday - now.weekday()) % 7 or 7
+    return now + timedelta(days=ahead)
+
+
+def month_year(s: Any) -> str | None:
+    """'2025-09-01' -> 'Sep 2025'."""
+    dt = parse_dt(s)
+    return f"{MONTHS[dt.month - 1]} {dt.year}" if dt else None
 
 
 def weekday_day_month(s: Any) -> str | None:
@@ -213,6 +229,10 @@ def biz_name(m: dict) -> str:
     return g(m, "identity", "name", default="your business")
 
 
+def possessive(name: str) -> str:
+    return f"{name}'" if name.endswith("s") else f"{name}'s"
+
+
 def locality(m: dict) -> str | None:
     return g(m, "identity", "locality")
 
@@ -252,6 +272,21 @@ def merchant_lang(cat: dict, m: dict) -> str:
 
 
 REGIONAL_GREETING = {"te": "Namaskaram", "ta": "Vanakkam", "kn": "Namaskara", "mr": "Namaskar"}
+
+
+LANG_NAME = {
+    "en": "English",
+    "hi": "Hindi",
+    "hinglish": "Hindi-English mix",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "kn": "Kannada",
+    "mr": "Marathi",
+}
+
+
+def lang_name(code: str) -> str:
+    return LANG_NAME.get(code, code)
 
 
 def customer_lang(c: dict | None) -> str:
@@ -308,6 +343,29 @@ def catalog_offer(
             if o.get("type") == t and ok_aud(o):
                 return o.get("title")
     return cands[0].get("title") if cands else None
+
+
+# words in a business name -> the catalog offer that fits that kind of place
+NAME_HINTS = (
+    (("pizza",), ("pizza",)),
+    (("kabab", "kebab", "tandoor", "biryani", "grill"), ("starter",)),
+    (("chai", "cafe", "café", "coffee", "bakery"), ("brunch", "30%")),
+    (("south indian", "madras", "udupi", "thali", "bhojan"), ("thali",)),
+    (("yoga", "pilates"), ("trial", "first month")),
+    (("dental", "dentist", "smile"), ("cleaning",)),
+)
+
+
+def suggested_offer(cat: dict, m: dict | None = None) -> str | None:
+    """Catalog template that suits *this* merchant (a pizza place gets the pizza
+    offer, not the thali). Always presented as a suggestion, never as live."""
+    name = (g(m or {}, "identity", "name") or "").lower()
+    for words, keywords in NAME_HINTS:
+        if any(w in name for w in words):
+            hit = catalog_offer(cat, keywords=keywords)
+            if hit and any(k in hit.lower() for k in keywords):
+                return hit
+    return catalog_offer(cat)
 
 
 def price_in(title: str | None) -> str | None:
@@ -415,7 +473,7 @@ THEME_LABEL = {
     "delivery_late": "late deliveries",
     "morning_crowd": "morning crowding",
     "doctor_manner": "chairside manner",
-    "stylist_skill": "stylist skill",
+    "stylist_skill": "stylists",
     "thali_quality": "thali",
     "pizza_quality": "pizza quality",
     "equipment_quality": "equipment",
@@ -477,6 +535,29 @@ def open_loop(m: dict) -> str | None:
     if last.get("from") == "merchant" and str(last.get("engagement", "")).startswith("intent"):
         return last.get("body")
     return None
+
+
+def owed_item(m: dict) -> tuple[str, str | None] | None:
+    """What Vera promised in the open loop, as a noun phrase:
+    'Want me to draft 3 posts you can review?' + 'Yes, focus on whitening and
+    aligners' -> ('the 3 posts', 'whitening and aligners')."""
+    if not open_loop(m):
+        return None
+    ask = (last_vera_turn(m) or {}).get("body", "")
+    hit = re.search(r"Want (?:me to )?([^?]+)\?", ask)
+    if not hit:
+        return None
+    thing = hit.group(1).strip()
+    thing = re.sub(r"^(?:add|draft|send|make|create|pull|set up|share|put|push)\s+", "", thing, flags=re.I)
+    thing = re.sub(r"\s+(?:you can review|for you|as a GBP post)$", "", thing)
+    thing = re.sub(r"^(?:a|an|me)\s+", "", thing)
+    if not thing.lower().startswith("the "):
+        thing = "the " + thing
+    subject = re.search(r"\b(?:recall|alert) on (\w+)", ask, re.I)
+    if subject:  # 'filtered for that molecule' -> 'filtered for atorvastatin'
+        thing = re.sub(r"\bthat (?:molecule|medicine|drug|batch)\b", subject.group(1), thing)
+    focus = re.search(r"focus(?:ed)? on ([^.!?]+)", open_loop(m) or "", re.I)
+    return thing, (focus.group(1).strip() if focus else None)
 
 
 def peer_gap_ctr(cat: dict, m: dict) -> tuple[str, str, float] | None:
@@ -558,3 +639,97 @@ def upcoming_beat(
 
     kw.sort(key=lambda b: ((start(b) - month) % 12, b.get("month_range", "")))
     return kw[0]
+
+
+# --------------------------------------------------------------------------- #
+# Headline evidence
+#
+# A reviewer (or the scoring judge) sees the trigger payload, the merchant's
+# 30-day views / calls / CTR, the signals list and the live offers. Messages
+# lead with those, so every claim can be checked against what the reader has.
+# Deeper context still shapes *what* we recommend.
+# --------------------------------------------------------------------------- #
+
+SIGNAL_PHRASES = {
+    "stale_posts": "your last Google post was {v} days ago",
+    "renewal_due_soon": "your plan renews in {v} days",
+    "dormant_with_vera": "we haven't spoken in {v} days",
+    "ctr_below_peer_median": "your CTR is below the peer median",
+    "above_peer_ctr": "your CTR is above the peer benchmark",
+    "above_peer_median_calls": "your calls are above the peer median",
+    "no_active_offers": "there's no live offer on your listing",
+    "unverified_gbp": "your Google listing is still unverified",
+    "high_risk_adult_cohort": "your profile is flagged for a high-risk adult patient cohort",
+    "growing_views_7d": "your views are growing this week",
+    "no_recent_post": "there's no recent Google post on your profile",
+    "trial_ending_soon": "your trial ends soon",
+    "delivery_not_set_up": "home delivery isn't set up yet",
+    "high_repeat_rate": "your repeat-customer rate is high",
+    "high_retention": "your member retention is high",
+    "perf_dip_severe": "your numbers are in a severe dip",
+}
+
+
+def signal_phrase(m: dict, key: str) -> str | None:
+    val = signal_value(m, key)
+    if val is None or key not in SIGNAL_PHRASES:
+        return None
+    number = re.sub(r"\D", "", val) if val else ""
+    template = SIGNAL_PHRASES[key]
+    if "{v}" in template and not number:
+        return None
+    return template.format(v=number)
+
+
+def perf_numbers(m: dict) -> tuple[int | None, int | None, str | None]:
+    views, calls, ctr = perf(m, "views"), perf(m, "calls"), perf(m, "ctr")
+    return views, calls, (ctr_str(ctr) if ctr is not None else None)
+
+
+def perf_line(m: dict, lead: str = "") -> str:
+    """'2,410 profile views → 18 calls in the last 30 days (CTR 2.1%)'."""
+    views, calls, ctr = perf_numbers(m)
+    if views is None or calls is None:
+        return ""
+    line = f"{num(views)} profile views and {num(calls)} calls in the last 30 days"
+    if ctr:
+        line += f" (CTR {ctr})"
+    return lead + line
+
+
+def weekly_views(m: dict) -> int | None:
+    views = perf(m, "views")
+    days = g(m, "performance", "window_days") or 30
+    return round(views * 7 / days) if views else None
+
+
+# --------------------------------------------------------------------------- #
+# Text repair
+# --------------------------------------------------------------------------- #
+
+# cp1252 renderings of UTF-8 continuation bytes (0x80-0xBF)
+_CONT = "\u0080-\u00bf€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ"
+_MOJIBAKE = re.compile(f"[\u00c2-\u00f4][{_CONT}]{{1,3}}")
+
+
+def _unmangle(match: re.Match) -> str:
+    chunk = match.group(0)
+    for end in range(len(chunk), 1, -1):  # longest valid UTF-8 sequence first
+        try:
+            return chunk[:end].encode("cp1252").decode("utf-8") + chunk[end:]
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            continue
+    return chunk
+
+
+def fix_text(value):
+    """Undo UTF-8 read as cp1252 ('â‚¹299' -> '₹299'), recursively. Happens when a
+    client on Windows loads the dataset without an explicit encoding. Only the
+    mangled sequences are touched, so correct text passes through unchanged."""
+    if isinstance(value, str):
+        return _MOJIBAKE.sub(_unmangle, value) if _MOJIBAKE.search(value) else value
+    if isinstance(value, list):
+        return [fix_text(v) for v in value]
+    if isinstance(value, dict):
+        return {k: fix_text(v) for k, v in value.items()}
+    return value

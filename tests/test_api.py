@@ -49,13 +49,17 @@ def test_tick_sends_once_per_suppression_key(client):
     assert first["actions"][0]["conversation_id"].startswith("conv_m_test")
 
 
-def test_one_message_per_merchant_per_tick(client):
+def test_per_merchant_cap_per_tick(client):
     push_trigger(client, "t1", urgency=2)
     push_trigger(client, "t2", kind="gbp_unverified", urgency=4)
-    actions = client.post("/v1/tick", json={"now": "2026-04-26T10:00:00Z", "available_triggers": ["t1", "t2"]}).json()[
-        "actions"
-    ]
-    assert [a["trigger_id"] for a in actions] == ["t2"]  # highest urgency wins
+    push_trigger(client, "t3", kind="gbp_unverified", urgency=3)
+    push_trigger(client, "t4", kind="renewal_due", urgency=1)
+    actions = client.post(
+        "/v1/tick", json={"now": "2026-04-26T10:00:00Z", "available_triggers": ["t1", "t2", "t3", "t4"]}
+    ).json()["actions"]
+    # highest urgency first, never two of the same kind, at most two per merchant
+    assert [a["trigger_id"] for a in actions] == ["t2", "t1"]
+    assert len({a["conversation_id"] for a in actions}) == 2
 
 
 def test_reply_continues_the_ticked_conversation(client):
@@ -73,3 +77,13 @@ def test_opted_out_merchant_gets_no_more_messages(client):
     client.post("/v1/reply", json={"conversation_id": action["conversation_id"], "merchant_id": "m_test",
                                    "from_role": "merchant", "message": "stop messaging me"})  # fmt: skip
     assert client.post("/v1/tick", json={"available_triggers": ["t2"]}).json()["actions"] == []
+
+
+def test_context_push_repairs_windows_mojibake(client):
+    garbled = "Dental Cleaning @ ₹299 — today".encode().decode("cp1252")
+    body = {"scope": "trigger", "context_id": "tm", "version": 1,
+            "payload": {"id": "tm", "kind": "perf_dip", "merchant_id": "m_test", "payload": {"note": garbled}}}  # fmt: skip
+    assert client.post("/v1/context", json=body).json()["accepted"]
+    from app import store
+
+    assert store.get("trigger", "tm")["payload"]["note"] == "Dental Cleaning @ ₹299 — today"

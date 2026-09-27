@@ -59,11 +59,11 @@ def _payload_facts(c: Ctx) -> str:
 
 def _fix_for(c: Ctx, key: str | None) -> tuple[str, str]:
     if key == "no_offer":
-        sug = F.catalog_offer(c.cat)
+        sug = F.suggested_offer(c.cat, c.m)
         if sug:
             return (
-                f"set up '{sug}' so visitors have something to act on",
-                f"'{sug}' set kar doon taaki visitors ko action ka reason mile",
+                f"set up magicpin's standard '{sug}' offer so visitors have something to act on",
+                f"magicpin ka standard '{sug}' offer set kar doon taaki visitors ko action ka reason mile",
             )
     return FIXES.get(key or "", ("send a 1-step plan for this", "iske liye 1-step plan bhej doon"))
 
@@ -77,8 +77,13 @@ def generic(c: Ctx) -> Draft:
         lead = f"{c.sal}, {why}"
         anchor = f"On your side, the thing that matters most right now: {hook.text}." if hook else ""
     elif hook:
-        # nothing usable in the payload: lead with the merchant's own fact
-        lead = f"{c.sal}, quick check on {F.biz_name(c.m)}: {hook.text}."
+        # nothing usable in the payload: lead with the merchant's own numbers and top gap
+        perf = F.perf_line(c.m, f"{F.biz_name(c.m)} had ")
+        if perf:
+            c.cite("merchant.performance")
+            lead = f"{c.sal}, quick check: {perf} — and {hook.text}."
+        else:
+            lead = f"{c.sal}, quick check on {F.biz_name(c.m)}: {hook.text}."
         anchor = ""
     else:
         lead = f"{c.sal}, a quick check-in from Vera."

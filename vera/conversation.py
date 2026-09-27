@@ -541,7 +541,7 @@ class ConversationEngine:
             if is_customer:
                 b = self._t(
                     cv,
-                    f"This is {F.biz_name(m)}'s WhatsApp assistant — messages here reach the team directly. Reply YES to confirm, or tell us what you need.",
+                    f"This is {F.possessive(F.biz_name(m))} WhatsApp assistant — messages here reach the team directly. Reply YES to confirm, or tell us what you need.",
                     f"Yeh {F.biz_name(m)} ka WhatsApp assistant hai — yahan ka message seedha team tak jaata hai. Confirm ke liye YES bhejiye.",
                 )
             return self._send(

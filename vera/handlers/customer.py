@@ -16,11 +16,9 @@ from __future__ import annotations
 import re
 
 from .. import facts as F
-from ..core import Ctx, Draft, cap
+from ..core import Ctx, Draft, because, cap
 
-
-def possessive(name: str) -> str:
-    return f"{name}'" if name.endswith("s") else f"{name}'s"
+possessive = F.possessive
 
 
 SERVICE_WORDS = {
@@ -84,9 +82,9 @@ NEXT_STEP = {
 
 SOFT_VALUE = {  # category-safe, claim-free value lines for thin-data sends
     "dentists": (
-        "A quick check every 6 months keeps small issues small.",
-        "Har 6 mahine ka check-up chhoti dikkat ko chhota hi rakhta hai.",
-        "Har 6 months ka check-up chhoti problems ko chhota hi rakhta hai.",
+        "A routine scaling and check-up every 6 months keeps small issues small.",
+        "Har 6 mahine ki scaling aur check-up chhoti dikkat ko chhota hi rakhti hai.",
+        "Har 6 months ki scaling aur check-up chhoti problems ko chhota hi rakhti hai.",
     ),
     "gyms": (
         "Even two sessions a week keeps the momentum going.",
@@ -114,6 +112,47 @@ def _live_offer(c: Ctx, *kw: str) -> str | None:
     if kw:
         return F.offer_matching(offers, *kw)
     return offers[0] if offers else None
+
+
+def _comeback_offer(c: Ctx) -> str | None:
+    """For a returning customer: a free add-on beats a new-member price."""
+    offers = F.active_offers(c.m)
+    free = F.offer_matching(offers, "free", "complimentary")
+    if free and "delivery" not in free.lower():
+        return free
+    return _live_offer(c, "clean", "check", "spa", "trial", "analysis") or (offers[0] if offers else None)
+
+
+def _history_line(v: CV) -> str:
+    """'You've been in 9 times since Sep 2025' — loyalty, from the customer's own record."""
+    rel = (v.c.cust or {}).get("relationship") or {}
+    n, first = rel.get("visits_total"), F.month_year(rel.get("first_visit"))
+    if not n or n < 3 or not first:
+        return ""
+    v.c.cite("customer.relationship.visits_total")
+    if v.c.slug == "pharmacies":
+        return v.t(
+            f"Thank you for trusting us since {first} — {n} visits so far.",
+            f"{first} se aapke bharose ke liye dhanyavaad — ab tak {n} visits.",
+            f"{first} se aapke trust ke liye thank you — ab tak {n} visits.",
+        )
+    return v.t(
+        f"You've been in {n} times since {first} — we'd love to keep that going.",
+        f"{first} se aap {n} baar aa chuke hain — yeh silsila jaari rakhiye.",
+        f"{first} se aap {n} baar aa chuke ho — yeh streak continue karte hain.",
+    )
+
+
+def _since(c: Ctx, iso: str | None) -> tuple[str, str] | None:
+    """('about 4 weeks', 'lagbhag 4 hafte') between the date and now."""
+    days = F.days_between(iso, c.now) if c.now and iso else None
+    if not days or days < 10:
+        return None
+    if days < 70:
+        w = round(days / 7)
+        return f"about {w} weeks", f"lagbhag {w} hafte"
+    mo = round(days / 30)
+    return f"about {mo} months", f"lagbhag {mo} mahine"
 
 
 def _slots(c: Ctx) -> list[str]:
@@ -184,7 +223,7 @@ def _months_ago(c: Ctx, iso: str | None) -> int | None:
 # --------------------------------------------------------------------------- #
 
 
-def recall_due(c: Ctx) -> Draft:
+def recall_due(c: Ctx, follow_up: bool = False) -> Draft:
     v = CV(c)
     p = c.payload
     rel = (c.cust or {}).get("relationship") or {}
@@ -193,7 +232,9 @@ def recall_due(c: Ctx) -> Draft:
     svc = F.humanize(p.get("service_due") or "").replace("6 month", "6-month")
     slots = _slots(c)
     c.cite("trigger.payload recall + customer.relationship")
-    offer = _live_offer(c, "clean", "check", "spa", "trial") if c.slug != "restaurants" else None
+    offer = (
+        (_live_offer(c, "clean", "check", "spa", "trial") or _comeback_offer(c)) if c.slug != "restaurants" else None
+    )
     emoji = {"dentists": " 🦷", "salons": " ✨", "gyms": " 💪"}.get(c.slug, "")
     parts = [v.greet(), v.sender(emoji.strip())]
     if svc and last:
@@ -207,17 +248,60 @@ def recall_due(c: Ctx) -> Draft:
                 + (f" {F.day_month(due)} tak due hai." if due else " ab due hai."),
             )
         )
-    elif last:
-        nxt = NEXT_STEP.get(c.slug, ("your next visit", "agli visit", "next visit"))
+    elif last and follow_up and c.slug == "dentists":
+        # a "refill" at a clinic = checking in after the last visit, not a 6-month recall
+        since = _since(c, last)
         parts.append(
             v.t(
-                f"Your last visit was on {F.day_month(last)} — it's a good time to plan {nxt[0]}.",
-                f"Aapki pichhli visit {F.day_month(last)} ko thi — ab {nxt[1]} plan karne ka sahi samay hai.",
-                f"Last visit {F.day_month(last)} ko thi — ab {nxt[2]} plan karne ka sahi time hai.",
+                f"Checking in after your visit on {F.day_month(last)}"
+                + (f" ({since[0]} ago)" if since else "")
+                + " — how are things feeling?",
+                f"{F.day_month(last)} ki visit ke baad haal-chaal poochh rahe hain — sab theek hai?",
+                f"{F.day_month(last)} ki visit ke baad check-in — sab theek lag raha hai?",
             )
         )
+        parts.append(
+            v.t(
+                "If anything still feels off, we'll find you a quick follow-up slot this week.",
+                "Agar abhi bhi koi takleef ho, to is hafte ek follow-up slot nikaal denge.",
+                "Agar kuch bhi off lage, is week ek quick follow-up slot mil jayega.",
+            )
+        )
+        offer = None
+    elif last:
+        nxt = NEXT_STEP.get(c.slug, ("your next visit", "agli visit", "next visit"))
+        since = _since(c, last)
+        if since:
+            parts.append(
+                v.t(
+                    f"It's been {since[0]} since your last visit on {F.day_month(last)} — a good time to plan {nxt[0]}.",
+                    f"{F.day_month(last)} ki pichhli visit ko {since[1]} ho gaye — ab {nxt[1]} plan karne ka sahi samay hai.",
+                    f"Last visit {F.day_month(last)} ko thi, {since[1]} ho gaye — ab {nxt[2]} plan karne ka sahi time hai.",
+                )
+            )
+        else:
+            parts.append(
+                v.t(
+                    f"Your last visit was on {F.day_month(last)} — it's a good time to plan {nxt[0]}.",
+                    f"Aapki pichhli visit {F.day_month(last)} ko thi — ab {nxt[1]} plan karne ka sahi samay hai.",
+                    f"Last visit {F.day_month(last)} ko thi — ab {nxt[2]} plan karne ka sahi time hai.",
+                )
+            )
+        if offer and "free" in offer.lower():
+            parts.append(
+                v.t(
+                    f"Come back for our '{offer}' — on us this week.",
+                    f"Is hafte '{offer}' hamari taraf se.",
+                    f"Is week '{offer}' hamari taraf se.",
+                )
+            )
+            c.cite("merchant.offers (active)")
+            offer = None  # already said
+        hist = _history_line(v)
         tip = SOFT_VALUE.get(c.slug)
-        if tip and not slots:
+        if hist:
+            parts.append(hist)
+        elif tip and not slots:
             parts.append(v.t(*tip))
     if slots:
         w = v.pref_window()
@@ -231,12 +315,20 @@ def recall_due(c: Ctx) -> Draft:
     if offer:
         parts.append(v.t(f"Current offer: {offer}.", f"Abhi ka offer: {offer}.", f"Current offer: {offer}."))
         c.cite("merchant.offers (active)")
-    cta, kind = _slot_cta(v, slots) if c.slug != "pharmacies" else (_order_cta(v), "binary_yes_no")
+    cta, kind = _slot_cta(v, slots) if c.slug != "pharmacies" else (_order_cta(v), "open_ended")
     parts.append(cta)
     return Draft(
         " ".join(parts),
         kind,
-        rationale="Customer recall: names the real last-visit date and due date, offers only the merchant's live offer and real slots, honours language + time preference; single reply action.",
+        rationale=because(
+            "Customer recall, single reply action",
+            "names the real last-visit date" if last else "",
+            "the due date from the payload" if due else "",
+            "the merchant's live offer" if offer else "",
+            "real slots from the payload" if slots else "",
+            "the customer's visit history" if any("visits_total" in u for u in c.used) else "",
+            f"the customer's {F.lang_name(v.lang)} language preference",
+        ),
         lever="personal_specificity+low_friction",
         next_action={"type": "book", "slots": slots, "topic": "recall"},
     )
@@ -260,6 +352,24 @@ def appointment_tomorrow(c: Ctx) -> Draft:
     visits = F.g(c.cust, "relationship", "visits_total")
     if visits and visits >= 3:
         parts.append(v.t("Always good to see you.", "Aapka intezaar rahega.", "Aapka wait rahega."))
+    elif not when and F.g(c.cust, "relationship", "last_visit"):
+        last = F.day_month(F.g(c.cust, "relationship", "last_visit"))
+        c.cite("customer.relationship.last_visit")
+        parts.append(
+            v.t(
+                f"Good to have you back — your last visit was on {last}.",
+                f"Aapko phir se dekhkar khushi hogi — pichhli baar aap {last} ko aaye the.",
+                f"Aapko wapas dekhkar achha lagega — last visit {last} ko thi.",
+            )
+        )
+    elif not when:
+        parts.append(
+            v.t(
+                "If you're running late, just message us here — we'll adjust.",
+                "Der ho rahi ho to yahin message kar dijiye — hum adjust kar lenge.",
+                "Late ho rahe ho to yahin message kar dijiye — hum adjust kar lenge.",
+            )
+        )
     parts.append(
         v.t(
             "Reply YES to confirm, or tell us a better time and we'll move it.",
@@ -270,7 +380,11 @@ def appointment_tomorrow(c: Ctx) -> Draft:
     return Draft(
         " ".join(parts),
         "binary_confirm_cancel",
-        rationale="Appointment reminder: confirm-or-reschedule in one reply; no invented time when the trigger has none.",
+        rationale=because(
+            "Appointment reminder, confirm-or-reschedule in one reply",
+            f"the booked time ({when})" if when else "no time in the trigger, so none is invented",
+            f"the customer's {F.lang_name(v.lang)} language preference",
+        ),
         lever="commitment+low_friction",
         next_action={"type": "confirm", "topic": "appointment"},
     )
@@ -283,7 +397,7 @@ def customer_lapsed(c: Ctx) -> Draft:
     days = p.get("days_since_last_visit")  # only trust an explicit number
     focus = p.get("previous_focus") or F.g(c.cust, "preferences", "training_focus")
     months = p.get("previous_membership_months")
-    offer = _live_offer(c)
+    offer = _comeback_offer(c)
     parts = [v.greet(), v.sender()]
     c.cite("trigger.payload lapse + customer.relationship")
     if days and days >= 14:
@@ -305,11 +419,15 @@ def customer_lapsed(c: Ctx) -> Draft:
                 f"{F.day_month(rel['last_visit'])} ke baad aapse mulaqat nahi hui — hope all good!",
             )
         )
+    visits = rel.get("visits_total")
     if focus:
+        work = f"{months} months" + (f" and {visits} sessions" if visits and visits >= 5 else "") if months else ""
+        if visits and visits >= 5:
+            c.cite("customer.relationship.visits_total")
         parts.append(
             v.t(
                 f"Your {F.humanize(focus)} plan is right where you left it"
-                + (f" after {months} months of work." if months else "."),
+                + (f" after {work} of work." if work else "."),
                 f"Aapka {F.humanize(focus)} plan wahin se shuru ho sakta hai"
                 + (f" — {months} mahine ki mehnat bekaar nahi jaane denge." if months else "."),
                 f"Aapka {F.humanize(focus)} plan wahin se continue ho sakta hai"
@@ -320,15 +438,23 @@ def customer_lapsed(c: Ctx) -> Draft:
     if offer:
         parts.append(
             v.t(
-                f"To ease back in: {offer}" + (f", {w} slots open." if w else "."),
+                (
+                    f"To ease back in, we'll extend our '{offer}' to you as a welcome-back"
+                    if "free" in offer.lower()
+                    else f"To ease back in: {offer}"
+                )
+                + (f", {w} slots open." if w else "."),
                 f"Wapas shuru karne ke liye: {offer}" + (f", {w} ke slots khaali hain." if w else "."),
                 f"Easy restart ke liye: {offer}" + (f", {w} slots available." if w else "."),
             )
         )
         c.cite("merchant.offers (active)")
-    if not focus and not offer:
+    if not focus:
+        hist = _history_line(v)
         tip = SOFT_VALUE.get(c.slug)
-        if tip:
+        if hist:
+            parts.append(hist)
+        if tip and (c.slug in ("dentists", "pharmacies") or (not hist and not offer)):
             parts.append(v.t(*tip))
     if c.slug == "pharmacies":
         parts.append(_order_cta(v))
@@ -338,6 +464,14 @@ def customer_lapsed(c: Ctx) -> Draft:
                 "Want us to keep a table for you this week? Reply YES.",
                 "Is hafte aapke liye table rakh dein? HAAN likhiye.",
                 "Is week aapke liye table rakh dein? YES reply kijiye.",
+            )
+        )
+    elif c.slug == "dentists":
+        parts.append(
+            v.t(
+                "Want us to hold a check-up slot for you this week? Reply YES — no commitment.",
+                "Is hafte aapke liye check-up ka slot rakh dein? HAAN likhiye — koi zabardasti nahi.",
+                "Is week aapke liye check-up slot hold kar dein? YES reply kijiye — no commitment.",
             )
         )
     else:
@@ -350,9 +484,14 @@ def customer_lapsed(c: Ctx) -> Draft:
         )
     return Draft(
         " ".join(parts),
-        "binary_yes_no",
-        rationale="Lapsed customer win-back: no-guilt framing, references their own goal/history, only the merchant's live offer, single no-commitment YES.",
-        lever="no_shame+personal_goal+low_friction",
+        "open_ended" if c.slug == "pharmacies" else "binary_yes_no",
+        rationale=because(
+            "Lapsed-customer win-back with no-guilt framing and one no-pressure reply",
+            f"their own {F.humanize(focus)} goal" if focus else "",
+            "their visit history" if any("visits_total" in u for u in c.used) else "",
+            f"the merchant's live offer ('{offer}')" if offer else "no offer quoted because none is live",
+        ),
+        lever="no_shame+personal_goal+low_friction" if focus else "no_shame+loyalty+low_friction",
         next_action={"type": "book", "topic": "winback"},
     )
 
@@ -404,7 +543,11 @@ def trial_followup(c: Ctx) -> Draft:
         return Draft(
             " ".join(parts),
             k,
-            rationale="Trial follow-up with thin data: relationship date + category-appropriate next step; single reply.",
+            rationale=because(
+                "Trial follow-up with thin data",
+                "the real last-visit date" if rel.get("last_visit") else "",
+                "a category-appropriate next step and one reply",
+            ),
             lever="momentum+low_friction",
             next_action={"type": "book", "topic": "trial"},
         )
@@ -418,10 +561,20 @@ def trial_followup(c: Ctx) -> Draft:
     return Draft(
         " ".join(parts),
         "binary_yes_no",
-        rationale="Trial follow-up while intent is fresh; addresses the parent for a child, uses the real next session and preference.",
+        rationale=because(
+            "Trial follow-up while intent is fresh",
+            "addresses the parent for a child" if who else "",
+            "the real next session from the payload" if slots else "",
+            "their time preference" if v.pref_window() else "",
+            f"the live offer ('{offer}')" if offer else "",
+        ),
         lever="momentum+low_friction",
         next_action={"type": "book", "slots": slots, "topic": "trial"},
     )
+
+
+def _count_hi(n: int) -> str:
+    return {2: "dono", 3: "teeno", 4: "chaaron"}.get(n, str(n))
 
 
 def _recalled_molecule(cat: dict, molecules: list[str]) -> tuple[str, dict] | tuple[None, None]:
@@ -474,7 +627,7 @@ def _refill_perks(v: CV, offers: list[str], senior: bool, address_saved: bool) -
 
 def chronic_refill_due(c: Ctx) -> Draft:
     if c.slug != "pharmacies":
-        return recall_due(c)  # a "refill" at a clinic/salon is really a follow-up visit
+        return recall_due(c, follow_up=True)  # a "refill" at a clinic/salon is really a follow-up visit
 
     v = CV(c)
     p = c.payload
@@ -494,9 +647,9 @@ def chronic_refill_due(c: Ctx) -> Draft:
         if runs_out:
             parts.append(
                 v.t(
-                    f"{whose} {n} monthly medicines ({mol_list}) will run out on {runs_out}.",
-                    f"{whose_hi} {n} mahine ki dawaiyan ({mol_list}) {runs_out} tak khatam ho jayengi.",
-                    f"{whose_hi} {n} monthly medicines ({mol_list}) {runs_out} ko khatam hongi.",
+                    f"{whose} {n} regular medicines ({mol_list}) will run out on {runs_out}.",
+                    f"{whose_hi} {_count_hi(n)} regular dawaiyan ({mol_list}) {runs_out} tak khatam ho jayengi.",
+                    f"{whose_hi} {_count_hi(n)} regular medicines ({mol_list}) {runs_out} ko khatam hongi.",
                 )
             )
         else:
@@ -516,12 +669,13 @@ def chronic_refill_due(c: Ctx) -> Draft:
         )
 
     recalled, alert = _recalled_molecule(c.cat, molecules)
+    src = f" ({alert.get('source')})" if recalled and alert.get("source") else ""
     if recalled:
         parts.append(
             v.t(
-                f"Note: some {recalled} batches are under a voluntary recall this month — we'll dispense only from an unaffected batch.",
-                f"Dhyan dein: is mahine {recalled} ke kuch batch recall hue hain — hum sirf safe batch se hi denge.",
-                f"Note: is mahine {recalled} ke kuch batches recall mein hain — hum sirf unaffected batch hi denge.",
+                f"Note: some {recalled} batches are under a voluntary recall this month{src} — a strength issue, not a safety one — and we'll dispense only from an unaffected batch.",
+                f"Dhyan dein: is mahine {recalled} ke kuch batch voluntary recall mein hain{src} — dawa ki taakat ka mamla hai, suraksha ka nahi — hum sirf safe batch se hi denge.",
+                f"Note: is mahine {recalled} ke kuch batches recall mein hain{src} — strength ka issue hai, safety ka nahi — hum sirf unaffected batch hi denge.",
             )
         )
         c.cite(f"category.digest[{alert.get('id')}] cross-check")
@@ -642,7 +796,11 @@ def generic_customer(c: Ctx) -> Draft:
     return Draft(
         " ".join(parts),
         k,
-        rationale=f"Customer trigger '{kind}' with thin data: relationship fact + live offer only; single reply.",
+        rationale=because(
+            f"Customer trigger '{kind}' with thin data, single reply",
+            "the real last-visit date" if rel.get("last_visit") else "",
+            f"the live offer ('{offer}')" if offer else "no offer quoted because none is live",
+        ),
         lever="personal+low_friction",
         next_action={"type": "book", "topic": kind},
     )

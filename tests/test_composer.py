@@ -108,7 +108,7 @@ def test_refill_cross_checks_recall_alert():
     t = {"id": "t", "scope": "customer", "kind": "chronic_refill_due", "customer_id": "c",
          "payload": {"molecule_list": ["metformin", "atorvastatin"], "stock_runs_out_iso": "2026-04-28"}}  # fmt: skip
     body = compose(pharmacy, shop, t, customer)["body"]
-    assert "Sharma ji's 2 monthly medicines" in body
+    assert "Sharma ji's 2 regular medicines" in body
     assert "atorvastatin batches are under a voluntary recall" in body
     assert "senior-citizen 15% discount" in body
 
@@ -119,3 +119,38 @@ def test_taboo_words_and_urls_are_scrubbed(dentists, clinic):
     body, notes = scrub("This is guaranteed. See https://example.com now.", dentists)
     assert "guaranteed" not in body and "http" not in body
     assert "url_removed" in notes
+
+
+def test_open_request_is_acknowledged_before_a_new_topic(dentists, clinic):
+    clinic["conversation_history"] = [
+        {"ts": "2026-04-24T10:12:00Z", "from": "vera", "body": "Want me to draft 3 posts you can review?"},
+        {"ts": "2026-04-24T10:18:00Z", "from": "merchant", "body": "Yes please, focus on whitening", "engagement": "intent_action"},
+    ]  # fmt: skip
+    body = compose(dentists, clinic, trigger("perf_dip"))["body"]
+    assert body.startswith(
+        "Dr. Asha, quick note — the 3 posts on whitening you asked for (24 Apr) are coming separately."
+    )
+
+
+def test_milestone_without_payload_celebrates_a_real_peer_comparison(dentists, clinic):
+    clinic["performance"]["ctr"] = 0.05  # vs 3.0% peer average
+    out = compose(dentists, clinic, trigger("milestone_reached"))
+    assert "your CTR is 5.0%, ahead of the 3.0% average for metro solo practices" in out["body"]
+
+
+def test_rationale_never_claims_an_offer_that_is_not_live(dentists, clinic):
+    customer = {
+        "customer_id": "c1",
+        "identity": {"name": "Reyansh", "language_pref": "en"},
+        "relationship": {"last_visit": "2026-04-01", "visits_total": 5, "first_visit": "2025-09-01"},
+        "consent": {"scope": ["promotional_offers"]},
+    }
+    t = trigger("customer_lapsed_soft", scope="customer", customer_id="c1")
+    out = compose(dentists, clinic, t, customer)
+    assert "check-up slot" in out["body"]
+    assert "no offer quoted because none is live" in out["rationale"]
+
+
+def test_weekly_views_use_the_real_window(dentists, clinic):
+    clinic["performance"].update(views=980, window_days=30)
+    assert "~229 profile views a week" in compose(dentists, clinic, trigger("perf_dip"))["body"]

@@ -20,6 +20,7 @@ class Ctx:
     trg: dict
     cust: dict | None = None
     now: datetime | None = None
+    roster: list = field(default_factory=list)  # the merchant's own customer contexts, if pushed
 
     # derived
     slug: str = ""
@@ -104,17 +105,74 @@ class Hook:
     text: str
     fix: str = ""  # what Vera proposes to do about it
     cite: str = ""
+    visible: bool = True  # can the reader check this from the headline numbers / signals / offers?
 
 
 def rank_hooks(c: Ctx) -> list[Hook]:
     """Score every grounded merchant-state fact; highest = most worth saying.
-    Scores blend severity (how far from peer / how big the swing) with
-    fixability (can Vera act on it in one step)."""
+
+    Scores blend severity (how far from normal, how big the swing) with
+    fixability (can Vera act on it in one step). Hooks built from the headline
+    evidence (views/calls/CTR, signals, live offers) are marked visible and
+    preferred by best_hook(), so the message stays checkable.
+    """
     m, cat = c.m, c.cat
     hooks: list[Hook] = []
     name = F.biz_name(m)
+    views, calls, ctr = F.perf_numbers(m)
 
-    # 1. calls / views swing (7d)
+    # 1. no live offer (visible: the live-offer list is empty)
+    if not F.active_offers(m):
+        sug = F.suggested_offer(cat, m)
+        hooks.append(
+            Hook(
+                "no_offer",
+                6.0,
+                "there's no live offer on your listing",
+                fix=f"put '{sug}' live" if sug else "",
+                cite="merchant.offers (none active)",
+            )
+        )
+
+    # 2. unverified listing
+    if F.has_signal(m, "unverified_gbp") or F.g(m, "identity", "verified") is False:
+        hooks.append(
+            Hook(
+                "unverified",
+                6.5,
+                f"{name} is still unverified on Google",
+                cite="merchant.signals.unverified_gbp",
+                visible=F.has_signal(m, "unverified_gbp"),
+            )
+        )
+
+    # 3. CTR — the number itself is visible; the peer benchmark only via the signal
+    peer = F.g(cat, "peer_stats", "avg_ctr")
+    if ctr and F.has_signal(m, "ctr_below_peer_median"):
+        hooks.append(
+            Hook(
+                "ctr_below_peer",
+                5.5,
+                f"your CTR is {ctr}, below the peer median",
+                cite="merchant.performance.ctr + signal ctr_below_peer_median",
+            )
+        )
+    elif ctr and peer and F.perf(m, "ctr") < peer * 0.85:
+        hooks.append(
+            Hook(
+                "ctr_below_peer",
+                5.0,
+                f"only {ctr} of the people who see your listing act on it",
+                cite="merchant.performance.ctr",
+            )
+        )
+
+    # 4. stale posts
+    stale = F.signal_phrase(m, "stale_posts") or F.signal_phrase(m, "no_recent_post")
+    if stale:
+        hooks.append(Hook("stale_posts", 4.5, stale, cite="merchant.signals.stale_posts"))
+
+    # 5. week-on-week swings: only the signal is visible, the delta itself isn't
     for key, label in (("calls_pct", "calls"), ("views_pct", "views")):
         d = F.delta(m, key)
         if d is None:
@@ -126,6 +184,7 @@ def rank_hooks(c: Ctx) -> list[Hook]:
                     6 + abs(d) * 10,
                     f"{label} are down {F.pct(d)} this week",
                     cite=f"merchant.performance.delta_7d.{key}={d}",
+                    visible=False,
                 )
             )
         elif d >= 0.15:
@@ -135,63 +194,11 @@ def rank_hooks(c: Ctx) -> list[Hook]:
                     4 + d * 10,
                     f"{label} are up {F.pct(d)} this week",
                     cite=f"merchant.performance.delta_7d.{key}={d}",
+                    visible=F.has_signal(m, "growing_views_7d"),
                 )
             )
 
-    # 2. CTR vs peers
-    gap = F.peer_gap_ctr(cat, m)
-    if gap and gap[2] <= -0.15:
-        hooks.append(
-            Hook(
-                "ctr_below_peer",
-                5 + abs(gap[2]) * 6,
-                f"your listing converts {gap[0]} of views into actions vs {gap[1]} for {F.peer_scope(cat)}",
-                cite="merchant.performance.ctr vs category.peer_stats.avg_ctr",
-            )
-        )
-    elif gap and gap[2] >= 0.25:
-        hooks.append(
-            Hook(
-                "ctr_above_peer",
-                2.5,
-                f"your CTR is {gap[0]} vs {gap[1]} for {F.peer_scope(cat)}",
-                cite="merchant.performance.ctr vs peer",
-            )
-        )
-
-    # 3. unverified GBP
-    if F.g(m, "identity", "verified") is False:
-        hooks.append(
-            Hook("unverified", 6.5, f"{name} is still unverified on Google", cite="merchant.identity.verified=false")
-        )
-
-    # 4. no active offer
-    if not F.active_offers(m):
-        sug = F.catalog_offer(cat)
-        hooks.append(
-            Hook(
-                "no_offer",
-                5.5,
-                "there is no active offer on your listing",
-                fix=f"put '{sug}' live" if sug else "",
-                cite="merchant.offers (none active)",
-            )
-        )
-
-    # 5. stale posts
-    sp = F.signal_value(m, "stale_posts")
-    if sp is not None:
-        days = sp.rstrip("d") if sp else None
-        hooks.append(
-            Hook(
-                "stale_posts",
-                4.5,
-                f"your last Google post was {days} days ago" if days else "your Google posts have gone stale",
-                cite="merchant.signals.stale_posts",
-            )
-        )
-
-    # 6. lapsed customers
+    # 6. deeper context — useful for judgment, not checkable from the headline view
     n, label = F.lapsed_count(m)
     if n:
         hooks.append(
@@ -200,43 +207,43 @@ def rank_hooks(c: Ctx) -> list[Hook]:
                 4 + min(n, 200) / 100,
                 f"{F.num(n)} customers haven't been back in {label}",
                 cite="merchant.customer_aggregate.lapsed",
+                visible=False,
             )
         )
-
-    # 7. negative review theme
     rt = F.review_theme(m, "neg")
     if rt and (rt.get("occurrences_30d") or 0) >= 2:
         hooks.append(
             Hook(
                 "neg_review",
                 4 + rt["occurrences_30d"] * 0.4,
-                f"{rt['occurrences_30d']} reviews this month mention {F.theme(rt['theme'])}",
+                f"recent reviews keep mentioning {F.theme(rt['theme'])}",
                 cite="merchant.review_themes",
+                visible=False,
             )
         )
-
-    # 8. positive review theme (proof / moat)
     rp = F.review_theme(m, "pos")
     if rp and (rp.get("occurrences_30d") or 0) >= 3:
         hooks.append(
             Hook(
                 "pos_review",
                 3 + rp["occurrences_30d"] * 0.1,
-                f"{rp['occurrences_30d']} reviews this month praise your {F.theme(rp['theme'])}",
+                f"your reviews keep praising your {F.theme(rp['theme'])}",
                 cite="merchant.review_themes",
+                visible=False,
             )
         )
 
-    # 9. renewal
+    # 7. renewal
+    renew = F.signal_phrase(m, "renewal_due_soon")
     dr = F.g(m, "subscription", "days_remaining")
-    if F.g(m, "subscription", "status") == "active" and dr is not None and dr <= 15:
-        plan = F.g(m, "subscription", "plan", default="")
+    if renew or (F.g(m, "subscription", "status") == "active" and dr is not None and dr <= 15):
         hooks.append(
             Hook(
                 "renewal",
                 5,
-                f"your {plan} plan renews in {dr} days".replace("  ", " "),
+                renew or f"your plan renews in {dr} days",
                 cite="merchant.subscription.days_remaining",
+                visible=bool(renew),
             )
         )
 
@@ -244,18 +251,34 @@ def rank_hooks(c: Ctx) -> list[Hook]:
     return hooks
 
 
-def best_hook(c: Ctx, exclude: tuple = (), prefer: tuple = ()) -> Hook | None:
-    hs = [h for h in rank_hooks(c) if h.key not in exclude]
-    for p in prefer:
-        for h in hs:
-            if h.key == p:
-                return h
-    return hs[0] if hs else None
+def best_hook(c: Ctx, exclude: tuple = (), prefer: tuple = (), visible_only: bool = True) -> Hook | None:
+    """Pick the one gap worth raising. Checkable hooks win over deeper ones
+    unless nothing checkable exists."""
+    hooks = [h for h in rank_hooks(c) if h.key not in exclude]
+    pools = [[h for h in hooks if h.visible], hooks] if visible_only else [hooks]
+    for pool in pools:
+        for p in prefer:
+            for h in pool:
+                if h.key == p:
+                    return h
+        if pool:
+            return pool[0]
+    return None
 
 
 def hook_text(c: Ctx, h: Hook) -> str:
     c.cite(h.cite)
     return h.text
+
+
+def because(lead: str, *parts: str) -> str:
+    """'<lead>: a, b and c.' from whichever parts are non-empty, so the
+    rationale only claims what the message actually does."""
+    ps = [p for p in parts if p]
+    if not ps:
+        return lead + "."
+    tail = ps[0] if len(ps) == 1 else ", ".join(ps[:-1]) + " and " + ps[-1]
+    return f"{lead}: {tail}."
 
 
 def cap(s: str) -> str:

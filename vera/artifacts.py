@@ -12,7 +12,7 @@ from .core import Ctx
 
 def _offer_or_catalog(c: Ctx) -> str:
     live = F.active_offers(c.m)
-    return live[0] if live else (F.catalog_offer(c.cat) or "")
+    return live[0] if live else (F.suggested_offer(c.cat, c.m) or "")
 
 
 def listing_first_line(c: Ctx) -> str:
@@ -27,7 +27,7 @@ def listing_first_line(c: Ctx) -> str:
 
 
 def offer_setup(c: Ctx) -> str:
-    o = F.catalog_offer(c.cat) or "your offer"
+    o = F.suggested_offer(c.cat, c.m) or "your offer"
     return (
         f'Offer ready to publish: "{o}"\n• Shows on your Google listing + magicpin page\n• Runs 30 days, you can pause anytime\n'
         f"• Google post: \"{o} at {F.biz_name(c.m)}, {F.locality(c.m) or ''}. Message us to book.\""
@@ -87,7 +87,7 @@ def recovery_plan(c: Ctx) -> str:
     h = {hk.key for hk in rank_hooks(c)}
     steps = []
     if "no_offer" in h:
-        steps.append(f"Put '{F.catalog_offer(c.cat)}' live today")
+        steps.append(f"Put '{F.suggested_offer(c.cat, c.m)}' live today")
     if "unverified" in h:
         steps.append("Verify your Google listing (one call)")
     steps.append("Post on Google every week (I'll draft them)")

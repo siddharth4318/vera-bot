@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import re
+
 from .. import facts as F
-from ..core import Ctx, Draft, yes_close
+from ..core import Ctx, Draft, because, yes_close
 from .fallback import generic
 
 
 def festival_upcoming(c: Ctx) -> Draft:
     p = c.payload
     fest, fdate, days = p.get("festival"), p.get("date"), p.get("days_until")
-    if fdate and c.now:  # live clock beats a stale snapshot in the payload
+    if days is None and fdate and c.now:  # only compute when the payload doesn't say
         live = F.days_between(c.now, fdate)
-        if live is not None and live >= 0:
-            days = live
+        days = live if live is not None and live >= 0 else None
     if not fest:
         return seasonal_nudge(c)
     c.cite("trigger.payload festival")
@@ -24,6 +25,22 @@ def festival_upcoming(c: Ctx) -> Draft:
         if any(k in b.get("note", "").lower() for k in ("festival", "wedding", "diwali"))
     ]
     beat = beats[0] if beats else None
+    fit_words = (
+        "bridal",
+        "spa",
+        "facial",
+        "package",
+        "combo",
+        "family",
+        "brunch",
+        "annual",
+        "couple",
+        "cleaning",
+        "whitening",
+    )
+    seasonal = F.offer_matching(offers, *fit_words)
+    if seasonal:  # lead with the live offer that suits a festive visit, not just the first one
+        offers = [seasonal] + [o for o in offers if o != seasonal]
     lead = f"{c.sal}, {fest} is on {F.day_month(fdate)}" + (f" — {days} days out." if days is not None else ".")
     if days is not None and days > 45:
         judg = "Too early to promote — but the right time to lock the plan, because"
@@ -32,21 +49,32 @@ def festival_upcoming(c: Ctx) -> Draft:
             c.cite("category.seasonal_beats")
         else:
             judg += f" the {c.cat.get('display_name', 'businesses').lower()} that pre-book early fill first."
-        ca = c.m.get("customer_aggregate") or {}
-        base = ca.get("total_unique_ytd")
+        views, calls, _ = F.perf_numbers(c.m)
         anchor = ""
-        if base:
-            anchor = f"You've served {F.num(base)} {F.people(c.slug)} this year — a pre-booking list opened to them first is the cheapest way to fill peak slots."
-            c.cite("merchant.customer_aggregate.total_unique_ytd")
+        if views and calls:
+            anchor = (
+                f"Your listing is already pulling {F.num(views)} views and {F.num(calls)} calls a month"
+                + (" (above the peer median for calls)" if F.has_signal(c.m, "above_peer_median_calls") else "")
+                + f" — open a {fest} pre-booking list to those {F.people(c.slug)} first and the peak slots fill before the rush."
+            )
+            c.cite("merchant.performance + signals")
+        hook_en = hook_hi = ""
+        if beat and "bridal" in beat.get("note", "") and not F.offer_matching(offers, "bridal"):
+            bridal = F.catalog_offer(c.cat, keywords=("bridal",))
+            if bridal and "bridal" in bridal.lower():  # the season is bridal-led: lead with a bridal offer
+                hook_en = f" built around a '{bridal}' offer (magicpin's standard)"
+                hook_hi = f" — '{bridal}' offer ke saath (magicpin ka standard)"
+                c.cite("category.offer_catalog (bridal)")
+        if not hook_en and offers:
+            hook_en, hook_hi = f" with '{offers[0]}' as the hook", f" — '{offers[0]}' ke saath"
         ask = yes_close(
-            c,
-            f"draft a '{fest} pre-booking' message" + (f" with '{offers[0]}' as the hook" if offers else ""),
-            f"'{fest} pre-booking' message draft kar doon" + (f" — '{offers[0]}' ke saath" if offers else ""),
+            c, f"draft a '{fest} pre-booking' message{hook_en}", f"'{fest} pre-booking' message draft kar doon{hook_hi}"
         )
     else:
         judg = "Now's the window — festive searches peak in the final 2-3 weeks."
-        anchor = ""
-        pack = offers[0] if offers else F.catalog_offer(c.cat)
+        views, _, _ = F.perf_numbers(c.m)
+        anchor = f"Your {F.num(views)} monthly profile views are the audience for it." if views else ""
+        pack = offers[0] if offers else F.suggested_offer(c.cat, c.m)
         ask = yes_close(
             c,
             f"put up a {fest} Google post + WhatsApp broadcast around '{pack}'",
@@ -56,7 +84,16 @@ def festival_upcoming(c: Ctx) -> Draft:
     return Draft(
         body,
         "binary_yes_no",
-        rationale=f"Festival {days}d away: timing judgment (plan vs promote) rather than a generic festive discount; anchored on the merchant's client base and live offer.",
+        rationale=because(
+            (
+                f"Festival {days} days away (payload), with a timing judgment (plan vs promote) instead of a generic festive discount"
+                if days is not None
+                else "Festival from the payload, with a timing judgment instead of a generic discount"
+            ),
+            "the category's seasonal beat" if any("seasonal_beats" in u for u in c.used) else "",
+            "the merchant's own views/calls" if any("performance" in u for u in c.used) else "",
+            "their live offer as the hook" if offers else "",
+        ),
         lever="timing_judgment+effort_externalization",
         next_action={
             "type": "deliver",
@@ -83,17 +120,26 @@ def seasonal_nudge(c: Ctx) -> Draft:
     offers = F.active_offers(c.m)
     note = beat.get("note", "").lower()
     ppl = F.people(c.slug)
+    views, calls, _ = F.perf_numbers(c.m)
     if any(k in note for k in ("retention", "repeat", "return")):
-        base = F.g(c.m, "customer_aggregate", "total_active_members") or F.g(
-            c.m, "customer_aggregate", "total_unique_ytd"
-        )
-        anchor = (
-            f"That favours your existing {ppl}"
-            + (f" — {F.num(base)} of them this year" if base else "")
-            + ", so the play is a come-back plan, not ads."
-        )
-        if base:
-            c.cite("merchant.customer_aggregate")
+        anchor = f"That favours your existing {ppl}, so the play is a come-back plan, not ads"
+        active = F.g(c.m, "customer_aggregate", "total_active_members")
+        ytd = F.g(c.m, "customer_aggregate", "total_unique_ytd")
+        if active:
+            anchor += f" — you have {F.num(active)} active {ppl} to build it around"
+            c.cite("merchant.customer_aggregate.total_active_members")
+        elif ytd:
+            anchor += (
+                f" — {F.num(ytd)} people have come through your doors this year, and they're the easiest to bring back"
+            )
+            c.cite("merchant.customer_aggregate.total_unique_ytd")
+        if views and calls is not None and (active or ytd):
+            anchor += f". New faces will find it too: {F.num(views)} profile views and {F.num(calls)} calls last month"
+            c.cite("merchant.performance")
+        elif views:
+            anchor += f" — {F.num(views)} people viewed your profile last month, so the audience is already there"
+            c.cite("merchant.performance.views")
+        anchor += "."
         pack = offers[0] if offers else None
         what = (
             f"draft an 8-week 'festive shape-up' plan + a WhatsApp invite for past {ppl}"
@@ -103,10 +149,22 @@ def seasonal_nudge(c: Ctx) -> Draft:
         )
         ask = yes_close(c, what, f"Purane {ppl} ke liye festive come-back message draft kar doon")
     else:
-        pack = offers[0] if offers else F.catalog_offer(c.cat)
-        anchor = "" if offers else "You have no offer live to catch it yet."
+        if offers:
+            pack = offers[0]
+            anchor = f"Your '{pack}' is the natural hook — lead with it early."
+            c.cite("merchant.offers")
+        else:
+            pack = F.suggested_offer(c.cat, c.m)
+            anchor = "There's no live offer on your listing to catch it yet"
+            if views:
+                anchor += f", and {F.num(views)} people viewed your profile in the last 30 days"
+                c.cite("merchant.performance.views")
+            anchor += "."
+            c.cite("merchant.offers (none active)")
+        label_en = f"'{pack}'" if offers else f"magicpin's standard '{pack}' offer"
+        label_hi = f"'{pack}'" if offers else f"magicpin ka standard '{pack}' offer"
         ask = yes_close(
-            c, f"set up '{pack}' + a festive Google post", f"'{pack}' aur ek festive Google post set kar doon"
+            c, f"set up {label_en} + a festive Google post", f"{label_hi} aur ek festive Google post set kar doon"
         )
     body = " ".join(x for x in [lead, anchor, ask] if x)
     return Draft(
@@ -133,50 +191,60 @@ def ipl_match_today(c: Ctx) -> Draft:
         h = t.hour % 12 or 12
         tm = f"{h}:{t.minute:02d}{'pm' if t.hour >= 12 else 'am'}"
     c.cite("trigger.payload match")
-    lead = f"{c.sal}, {match} at {venue} tonight{', ' + tm if tm else ''}."
     offers = F.active_offers(c.m)
-    ca = c.m.get("customer_aggregate") or {}
-    deliv, dine = ca.get("delivery_orders_30d"), ca.get("dine_in_orders_30d")
+    views, _, _ = F.perf_numbers(c.m)
+    weekday_offer = F.offer_matching(offers, "tue-thu", "tue", "weekday", "mon-thu")
+
+    match_dt = F.parse_dt(p.get("match_time_iso")) or c.now
+    day = match_dt.strftime("%A") if match_dt else ""
     if weeknight is False:
+        kind = f"a {day} match" if day in ("Saturday", "Sunday") else "a weekend match"
+        lead = f"{c.sal}, {match} at {venue} tonight{', ' + tm if tm else ''} — and it's {kind}."
         judg = "Counter-intuitive call: skip the dine-in match promo tonight."
-        if item and "Saturday" in item.get("summary", "") + item.get("title", ""):
-            judg += (
-                " "
-                + "Saturday IPL games pull people to watch at home — restaurant covers drop ~12% vs a normal Saturday (magicpin order data)."
-            )
+        drop = re.search(r"covers down (\d+)%", (item or {}).get("summary", ""))
+        if item and drop:
+            src = item.get("source") or "magicpin order data"
+            if day == "Saturday":
+                judg += f" Saturday IPL nights ran {drop.group(1)}% below a normal Saturday for restaurant covers ({src}) — people host home-watch parties instead."
+            else:
+                judg += f" On IPL Saturdays, restaurant covers ran {drop.group(1)}% below a normal Saturday ({src}) — a {day or 'weekend'} match keeps people home the same way."
             c.cite(f"category.digest[{item.get('id')}]")
-        mix = ""
-        if deliv and dine:
-            mix = f"Your own mix already leans delivery — {deliv} delivery vs {dine} dine-in orders in 30 days — so ride that."
-            c.cite("merchant.customer_aggregate delivery/dine-in")
-        bogo = F.offer_matching(offers, "tue-thu", "tue", "weekday")
-        save = ""
-        if bogo:
-            save = f"Keep '{bogo}' for the next weeknight match, where covers run ~18% higher."
+        elif item and "Saturday" in item.get("summary", "") + item.get("title", ""):
+            judg += " Weekend matches pull people into home-watch parties instead of restaurants."
+            c.cite(f"category.digest[{item.get('id')}]")
+        save = (
+            f"Your '{weekday_offer}' doesn't run tonight anyway — keep it for the next weeknight match."
+            if weekday_offer
+            else ""
+        )
+        play = "Play delivery instead — tonight people order in, they don't walk in."
+        when = "an hour before the start" if tm else "before the toss"
         combo = F.catalog_offer(c.cat, keywords=("match",))
+        combo = combo if combo and "match" in combo.lower() else None
+        label = f"a delivery-only version of the '{combo}'" if combo else "a delivery-only match-night combo"
+        if combo:
+            c.cite("category.offer_catalog (match-night combo)")
         ask = yes_close(
             c,
-            (
-                f"draft a delivery-only '{combo}' Insta story to go live at 6:30pm"
-                if combo
-                else "draft a delivery-only match-night story for 6:30pm"
-            ),
-            (
-                f"6:30pm ke liye delivery-only '{combo}' Insta story draft kar doon"
-                if combo
-                else "6:30pm ke liye delivery-only match story bana doon"
-            ),
+            f"set up {label} + an Insta story to go live {when}",
+            f"Match se ek ghanta pehle {label} + Insta story live kar doon",
         )
-        body = " ".join(x for x in [lead, judg, mix, save, ask] if x)
-        rat = "Saturday match: data says covers fall, so the bot recommends against the obvious dine-in promo and redirects to delivery (merchant's stronger channel), preserving the weekday BOGO."
+        body = " ".join(x for x in [lead, judg, save, play, ask] if x)
+        rat = "Weekend match (payload is_weeknight=false): covers fall on weekend match nights, so the bot recommends against the obvious dine-in promo, notes the live weekday offer can't run tonight, and redirects to delivery."
     else:
-        promo = offers[0] if offers else F.catalog_offer(c.cat, keywords=("match",))
-        judg = "Weeknight matches run ~18% above normal covers — tonight is worth a push."
-        ask = yes_close(
-            c,
-            f"push '{promo}' as a match-night post + WhatsApp blast at 6pm",
-            f"6pm par '{promo}' ka match-night post + WhatsApp blast kar doon",
+        lead = f"{c.sal}, {match} at {venue} tonight{', ' + tm if tm else ''}."
+        promo = weekday_offer or (offers[0] if offers else None)
+        judg = "Weeknight matches pull people out — tonight is worth a push."
+        lift = re.search(r"Weeknight matches drive \+(\d+)% covers", (item or {}).get("summary", ""))
+        if item and lift:
+            judg = f"Weeknight matches drive +{lift.group(1)}% covers ({item.get('source') or 'magicpin order data'}) — tonight is worth a push."
+            c.cite(f"category.digest[{item.get('id')}]")
+        what = (
+            f"push '{promo}' as a match-night post + WhatsApp blast an hour before the start"
+            if promo
+            else "put up a match-night post + WhatsApp blast an hour before the start"
         )
+        ask = yes_close(c, what, f"Match se ek ghanta pehle '{promo or 'match-night'}' post + WhatsApp blast kar doon")
         body = " ".join(x for x in [lead, judg, ask] if x)
         rat = "Weeknight match: covers rise, push the live offer."
     return Draft(
@@ -187,8 +255,8 @@ def ipl_match_today(c: Ctx) -> Draft:
         next_action={
             "type": "deliver",
             "topic": "match night",
-            "artifact": f'Insta story: "{match} tonight 🏏 Watch at home, we\'ll bring the pizza — order before the toss!"',
-            "confirm_en": "schedule it for 6:30pm",
+            "artifact": f'Insta story: "{match} tonight 🏏 Watching at home? {F.biz_name(c.m)} delivers — order before the toss!"',
+            "confirm_en": "schedule it for an hour before the match",
         },
     )
 
