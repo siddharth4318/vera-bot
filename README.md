@@ -93,4 +93,5 @@ export VERA_DATASET=path/to/expanded
 pytest                                   # 300+ tests, ~1s
 python scripts/generate_submission.py    # writes submission.jsonl for the 30 test pairs
 python scripts/simulate_judge.py         # end-to-end run against the local server
+python scripts/chat.py                   # chat with Vera in the terminal (no server, no API key)
 ```
