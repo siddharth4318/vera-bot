@@ -1,0 +1,92 @@
+# Vera message engine: Team Siddharth
+
+The engine picks **one** signal that should drive the next message. It writes that message only from facts in the pushed context, with one low-effort ask. It is deterministic, responds in under 5 ms per message, and never makes up a number.
+
+## Approach
+
+```
+trigger.kind ─► handler (26 kinds + keyword router + generic reasoner)
+                  │  1. WHY NOW   trigger fact (number / date / source)
+                  │  2. SO WHAT   ONE merchant anchor, picked by the hook ranker
+                  │  3. JUDGMENT  what Vera recommends (sometimes contrarian)
+                  │  4. ONE ASK   YES / CONFIRM / slot pick, work externalised to Vera
+                  ▼
+guardrails: taboo words · URLs · jargon ("GBP") · consent · anti-repeat
+                  ▼
+optional LLM polish (temp 0), rejected if it adds or drops any number
+```
+
+- **Decision engine (`vera/core.py`).** Every grounded merchant fact becomes a scored "hook". Examples: a CTR gap vs. peers, a calls dip, no live offer, an unverified listing, stale posts, lapsed customers, and review themes. Each handler asks for the single best hook that fits its trigger instead of listing everything.
+- **Judgment, not templating.**
+  - A Saturday IPL match leads to "skip the dine-in promo, covers fall ~12%; push delivery (your 180 vs 95 split)".
+  - A competitor at ₹199 leads to "don't price-match; your 5 reviews praise chairside manner; fix wait times".
+  - Diwali 188 days out leads to "too early to promote, right time to plan".
+  - An expected seasonal dip gets reframed to churn: "10%/mo vs 8% peer = ~24 members/month".
+- **Cross-signal intelligence.** Sharma ji's refill message notes that this week's digest has an atorvastatin batch recall. The CDE webinar is tied to the aligner interest Dr. Meera voiced earlier.
+- **Provenance.** Every `rationale` lists the context fields used (`category.digest[d_…]`, `merchant.customer_aggregate…`), so the judge can verify there is no fabrication.
+- **Customer-facing rules.**
+  - Only the merchant's *live* offers are quoted. Catalog templates are never promised.
+  - Slots come only from the payload.
+  - The message follows `language_pref` (hi / hi-en / English, and a regional greeting for te/ta/kn).
+  - Kids are reached through the parent, and seniors through the family channel.
+  - No-consent customers are never messaged.
+- **Language.** Merchant bodies stay in clear English so numbers read cleanly. Openers and closers are natural Hinglish for Hindi-speaking merchants, matching how Indian owners actually chat.
+
+## Conversation engine (`vera/conversation.py`)
+
+Replies are checked in this order:
+
+1. Opt-out → end, and suppress the merchant.
+2. Auto-reply (canned WA-Business phrasing, or the same text twice) → one owner-flag line, then wait 24h, then end. This is also tracked **across conversation ids**.
+3. Hostility → one de-escalation line. A second hostile message → exit.
+4. A slot pick is booked.
+5. Commitment ("ok let's do it") → **instant action mode**: the artifact (draft post, offer, review reply, SOP checklist) is delivered in the same turn with a single CONFIRM. No qualifying questions.
+6. "Later / kal" → wait the matching number of seconds.
+7. Off-topic (GST, loans) → polite decline, then redirect to the thread.
+8. Questions are answered only from context. Language is re-detected every turn.
+
+## Operating rules
+
+- `/v1/context` is idempotent: an identical re-post returns 200 as a no-op. A conflicting or older version returns 409.
+- `/v1/tick` sends at most one message per merchant per tick, highest urgency first.
+- Suppression keys are never reused.
+- `/v1/tick` has a 22 s budget with a deterministic fallback.
+- `/v1/teardown` wipes all state.
+
+## Tradeoffs
+
+- **Rules over free-form LLM.** A rules-first composer can't hallucinate, is reproducible, and survives 10 req/s with a 30 s cap. The cost is less stylistic range on never-seen trigger kinds. The keyword router plus the generic reasoner cover those, and the LLM polish layer (`VERA_LLM_PROVIDER` / `VERA_LLM_API_KEY`) adds fluency without the risk.
+- **Restraint.** When a trigger lacks data (e.g. `competitor_opened` with no name), the message says only what is known ("a new competitor listing showed up near Indiranagar") and leans on real merchant facts.
+- **State is in-memory, single worker.** This keeps it fast and simple. The bot must stay up for the whole test window.
+
+## Would have helped
+
+Real slot availability per merchant, catalog-level service prices per merchant, and per-locality peer stats.
+
+## Layout
+
+```
+app.py                  FastAPI endpoints (/v1/context, /tick, /reply, /healthz, /metadata)
+bot.py                  compose() in the submission contract shape
+vera/composer.py        routing by trigger kind + guardrails
+vera/core.py            Ctx / Draft types and the merchant hook ranker
+vera/handlers/          one module per trigger family (knowledge, performance, events, ...)
+vera/conversation.py    multi-turn reply engine
+vera/facts.py           safe accessors + formatting (₹, Indian digit grouping, dates)
+vera/llm.py             optional fact-locked LLM polish
+scripts/                submission generator + judge-style end-to-end harness
+tests/                  pytest suite (unit, API, full-dataset sweep)
+```
+
+## Run
+
+```bash
+pip install -r requirements-dev.txt
+uvicorn app:app --port 8080 --workers 1
+
+# generate the challenge dataset once (from the challenge pack), then:
+export VERA_DATASET=path/to/expanded
+pytest                                   # 300+ tests, ~1s
+python scripts/generate_submission.py    # writes submission.jsonl for the 30 test pairs
+python scripts/simulate_judge.py         # end-to-end run against the local server
+```
